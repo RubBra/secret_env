@@ -1,0 +1,185 @@
+#!/bin/bash
+
+CONFIG_DIR="$HOME/.config/senf"
+SALT_FILE="$CONFIG_DIR/salt"
+ENV_FILE="$CONFIG_DIR/senf.enc"
+TEMP_FILE="/tmp/senf_$$"
+
+# Ensure cleanup on script exit, interrupt, and termination
+trap 'rm -f $TEMP_FILE' EXIT INT TERM
+
+# Create config directory if it doesn't exist
+mkdir -p "$CONFIG_DIR"
+chmod 700 "$CONFIG_DIR"
+
+# Generate salt if it doesn't exist
+if [ ! -f "$SALT_FILE" ]; then
+    openssl rand -hex 16 > "$SALT_FILE"
+    chmod 600 "$SALT_FILE"
+fi
+
+generate_key() {
+    local password="$1"
+    local salt=$(cat "$SALT_FILE")
+    echo -n "$password$salt" | sha256sum | awk '{print $1}'
+}
+
+# Securely read password
+read_password() {
+    local prompt="$1"
+    local password
+    read -s -p "$prompt" password
+    echo >&2
+    echo "$password"
+}
+
+encrypt_file() {
+    local key="$1"
+    local input_file="$2"
+    local output_file="$3"
+    openssl enc -aes-256-cbc -salt -pbkdf2 -pass pass:"$key" -in "$input_file" -out "$output_file"
+}
+
+decrypt_file() {
+    local key="$1"
+    local input_file="$2"
+    local output_file="$3"
+    openssl enc -aes-256-cbc -d -salt -pbkdf2 -pass pass:"$key" -in "$input_file" -out "$output_file" 2>/dev/null
+    return $?
+}
+
+check_variable_exists() {
+    local var_name="$1"
+    local temp_file="$2"
+    if grep -q "^export $var_name=" "$temp_file"; then
+        echo "Notice: Variable $var_name already exists and will be overwritten."
+    fi
+}
+
+source_and_remove() {
+    local temp_file="$1"
+    . "$temp_file"
+    rm -f "$temp_file"
+}
+
+print_variables() {
+    local temp_file="$1"
+    echo "Current environment variables:"
+    echo "-----------------------------"
+    grep "^export" "$temp_file" | sed 's/export //'
+    rm -f "$temp_file"
+}
+
+case "$1" in
+    "-add")
+        password=$(read_password "Enter password: ")
+        key=$(generate_key "$password")
+        touch "$TEMP_FILE"
+        chmod 600 "$TEMP_FILE"
+        
+        if [ -f "$ENV_FILE" ]; then
+            if ! decrypt_file "$key" "$ENV_FILE" "$TEMP_FILE"; then
+                rm -f "$TEMP_FILE"
+                echo "Invalid password"
+                exit 1
+            fi
+        fi
+        
+        read -p "Enter environment variable name: " var_name
+        check_variable_exists "$var_name" "$TEMP_FILE"
+        read -p "Enter value: " secret_value
+        
+        # Create temporary file for new content
+        temp_new_file=$(mktemp)
+        chmod 600 "$temp_new_file"
+        grep -v "^export $var_name=" "$TEMP_FILE" > "$temp_new_file" 2>/dev/null
+        echo "export $var_name='$secret_value'" >> "$temp_new_file"
+        
+        encrypt_file "$key" "$temp_new_file" "$ENV_FILE"
+        chmod 600 "$ENV_FILE"
+        
+        # Clean up
+        rm -f "$TEMP_FILE" "$temp_new_file"
+        echo "Environment variable added successfully"
+        ;;
+
+    "-remove")
+        if [ -z "$2" ]; then
+            echo "Error: Please specify the variable name to remove"
+            echo "Usage: $0 -remove VARIABLE_NAME"
+            exit 1
+        fi
+        var_name="$2"
+        
+        password=$(read_password "Enter password: ")
+        key=$(generate_key "$password")
+        
+        if [ ! -f "$ENV_FILE" ]; then
+            echo "No encrypted environment file found"
+            exit 1
+        fi
+        
+        if ! decrypt_file "$key" "$ENV_FILE" "$TEMP_FILE"; then
+            rm -f "$TEMP_FILE"
+            echo "Invalid password"
+            exit 1
+        fi
+        
+        # Check if variable exists
+        if ! grep -q "^export $var_name=" "$TEMP_FILE"; then
+            echo "Variable $var_name not found"
+            rm -f "$TEMP_FILE"
+            exit 1
+        fi
+        
+        # Create temporary file for new content
+        temp_new_file=$(mktemp)
+        chmod 600 "$temp_new_file"
+        grep -v "^export $var_name=" "$TEMP_FILE" > "$temp_new_file"
+        
+        encrypt_file "$key" "$temp_new_file" "$ENV_FILE"
+        chmod 600 "$ENV_FILE"
+        
+        rm -f "$TEMP_FILE" "$temp_new_file"
+        echo "Environment variable $var_name removed successfully"
+        ;;
+        
+    "-print")
+        password=$(read_password "Enter password: ")
+        key=$(generate_key "$password")
+        
+        if [ ! -f "$ENV_FILE" ]; then
+            echo "No encrypted environment file found"
+            exit 1
+        fi
+        
+        if ! decrypt_file "$key" "$ENV_FILE" "$TEMP_FILE"; then
+            rm -f "$TEMP_FILE"
+            echo "Invalid password"
+            exit 1
+        fi
+        
+        print_variables "$TEMP_FILE"
+        ;;
+        
+    *)
+        # Load environment variables
+        password=$(read_password "Enter password: ")
+        key=$(generate_key "$password")
+        
+        if [ ! -f "$ENV_FILE" ]; then
+            echo "No encrypted environment file found"
+            exit 1
+        fi
+        
+        if ! decrypt_file "$key" "$ENV_FILE" "$TEMP_FILE"; then
+            rm -f "$TEMP_FILE"
+            echo "Invalid password"
+            exit 1
+        fi
+        
+        # Source and immediately remove the temporary file
+        source_and_remove "$TEMP_FILE"
+        echo "Environment variables loaded successfully"
+        ;;
+esac
